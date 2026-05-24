@@ -262,6 +262,9 @@ static int loglevel_parser(const struct option *opt, const char *arg, int unset)
 	OPT_CALLBACK('\0', "vfio-pci", NULL, "[domain:]bus:dev.fn",	\
 		     "Assign a PCI device to the virtual machine",	\
 		     vfio_device_parser, kvm),				\
+	OPT_CALLBACK('\0', "vfio-platform", NULL, "device_name",	\
+		     "Assign a platform device to the virtual machine",	\
+		     vfio_device_parser, kvm),				\
 									\
 	OPT_GROUP("Debug options:"),					\
 	OPT_CALLBACK_NOOPT('\0', "debug", kvm, NULL,			\

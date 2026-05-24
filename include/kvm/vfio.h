@@ -23,6 +23,7 @@
 
 enum vfio_device_type {
 	VFIO_DEVICE_PCI,
+	VFIO_DEVICE_PLATFORM,
 };
 
 /* MSI/MSI-X capability enabled */
@@ -83,6 +84,19 @@ struct vfio_pci_device {
 	struct vfio_pci_msix_pba	msix_pba;
 };
 
+/*
+	中断
+*/
+struct vfio_platform_device {
+	int				irq_fd;
+	int				unmask_fd;
+	unsigned int			gsi;
+	struct vfio_irq_info		irq_info;
+	char				*compatible;
+	size_t				compatible_len;
+	unsigned int			fdt_region_index;
+};
+
 struct vfio_region {
 	struct vfio_region_info		info;
 	struct vfio_device		*vdev;
@@ -104,6 +118,7 @@ struct vfio_device {
 	char				*sysfs_path;
 
 	struct vfio_pci_device		pci;
+	struct vfio_platform_device	platform;
 };
 
 struct vfio_device_params {
@@ -125,5 +140,7 @@ int vfio_map_region(struct kvm *kvm, struct vfio_device *vdev,
 void vfio_unmap_region(struct kvm *kvm, struct vfio_region *region);
 int vfio_pci_setup_device(struct kvm *kvm, struct vfio_device *device);
 void vfio_pci_teardown_device(struct kvm *kvm, struct vfio_device *vdev);
+int vfio_platform_setup_device(struct kvm *kvm, struct vfio_device *vdev);
+void vfio_platform_teardown_device(struct kvm *kvm, struct vfio_device *vdev);
 
 #endif /* KVM__VFIO_H */

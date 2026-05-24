@@ -39,6 +39,20 @@ static int vfio_device_pci_parser(const struct option *opt, char *arg,
 	return 0;
 }
 
+static int vfio_device_platform_parser(const struct option *opt, char *arg,
+				       struct vfio_device_params *dev)
+{
+	(void)opt;
+
+	dev->type = VFIO_DEVICE_PLATFORM;
+	dev->bus = "platform";
+	dev->name = strdup(arg);
+	if (!dev->name)
+		return -ENOMEM;
+
+	return 0;
+}
+
 int vfio_device_parser(const struct option *opt, const char *arg, int unset)
 {
 	int ret = -EINVAL;
@@ -70,6 +84,8 @@ int vfio_device_parser(const struct option *opt, const char *arg, int unset)
 
 	if (!strcmp(opt->long_name, "vfio-pci"))
 		ret = vfio_device_pci_parser(opt, cur, dev);
+	else if (!strcmp(opt->long_name, "vfio-platform"))
+		ret = vfio_device_platform_parser(opt, cur, dev);
 	else
 		ret = -EINVAL;
 
@@ -318,6 +334,10 @@ static int vfio_configure_device(struct kvm *kvm, struct vfio_device *vdev)
 	case VFIO_DEVICE_PCI:
 		BUG_ON(!(vdev->info.flags & VFIO_DEVICE_FLAGS_PCI));
 		ret = vfio_pci_setup_device(kvm, vdev);
+		break;
+	case VFIO_DEVICE_PLATFORM:
+		BUG_ON(!(vdev->info.flags & VFIO_DEVICE_FLAGS_PLATFORM));
+		ret = vfio_platform_setup_device(kvm, vdev);
 		break;
 	default:
 		BUG_ON(1);
@@ -588,6 +608,9 @@ static void vfio_device_exit(struct kvm *kvm, struct vfio_device *vdev)
 	switch (vdev->params->type) {
 	case VFIO_DEVICE_PCI:
 		vfio_pci_teardown_device(kvm, vdev);
+		break;
+	case VFIO_DEVICE_PLATFORM:
+		vfio_platform_teardown_device(kvm, vdev);
 		break;
 	default:
 		vfio_dev_warn(vdev, "no teardown function for device");
