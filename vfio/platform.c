@@ -6,7 +6,10 @@
 
 #include <linux/kernel.h>
 
+#include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
@@ -20,7 +23,7 @@
 
 static u64 vfio_platform_mmio_base = VFIO_PLATFORM_MMIO_BASE;
 
-#define VFIO_PLATFORM_COMPATIBLE_MAX	4096
+#define VFIO_PLATFORM_PROP_MAX		4096
 #define VFIO_PLATFORM_NODE_NAME_MAX	64
 
 union vfio_irq_eventfd {
@@ -33,44 +36,63 @@ static void set_vfio_irq_eventfd_payload(union vfio_irq_eventfd *evfd, int fd)
 	memcpy(&evfd->irq.data, &fd, sizeof(fd));
 }
 
-static int vfio_platform_read_compatible(struct vfio_device *vdev)
+static int vfio_platform_read_of_property(struct vfio_device *vdev,
+					  const char *property, char **data,
+					  size_t *data_len, bool required)
 {
-	struct vfio_platform_device *pdev = &vdev->platform;
 	char path[PATH_MAX];
-	char *compatible;
+	char *buf;
 	ssize_t len;
 	int fd, ret;
 
-	ret = snprintf(path, sizeof(path), "%s/of_node/compatible",
-		       vdev->sysfs_path);
+	ret = snprintf(path, sizeof(path), "%s/of_node/%s", vdev->sysfs_path,
+		       property);
 	if (ret < 0 || ret >= (int)sizeof(path))
 		return -EINVAL;
 
-	compatible = malloc(VFIO_PLATFORM_COMPATIBLE_MAX);
-	if (!compatible)
+	buf = malloc(VFIO_PLATFORM_PROP_MAX);
+	if (!buf)
 		return -ENOMEM;
 
 	fd = open(path, O_RDONLY);
 	if (fd < 0) {
-		ret = -errno;
+		ret = required ? -errno : 0;
 		goto err_free;
 	}
 
-	len = read(fd, compatible, VFIO_PLATFORM_COMPATIBLE_MAX);
+	len = read(fd, buf, VFIO_PLATFORM_PROP_MAX);
 	close(fd);
 	if (len <= 0) {
-		ret = len ? -errno : -EINVAL;
+		ret = required ? (len ? -errno : -EINVAL) : 0;
 		goto err_free;
 	}
 
-	pdev->compatible = compatible;
-	pdev->compatible_len = len;
+	*data = buf;
+	*data_len = len;
 
 	return 0;
 
 err_free:
-	free(compatible);
+	free(buf);
 	return ret;
+}
+
+static int vfio_platform_read_compatible(struct vfio_device *vdev)
+{
+	struct vfio_platform_device *pdev = &vdev->platform;
+
+	return vfio_platform_read_of_property(vdev, "compatible",
+					      &pdev->compatible,
+					      &pdev->compatible_len, true);
+}
+
+static int vfio_platform_read_irq_names(struct vfio_device *vdev)
+{
+	struct vfio_platform_device *pdev = &vdev->platform;
+
+	return vfio_platform_read_of_property(vdev, "interrupt-names",
+					      &pdev->irq_names,
+					      &pdev->irq_names_len, false);
 }
 
 #ifdef CONFIG_HAS_LIBFDT
@@ -84,26 +106,85 @@ static void vfio_platform_generate_fdt(void *fdt,
 	struct vfio_region *region = &vdev->regions[pdev->fdt_region_index];
 	const char *name = strchr(vdev->params->name, '.');
 	char dev_name[VFIO_PLATFORM_NODE_NAME_MAX];
-	u64 reg_prop[] = {
-		cpu_to_fdt64(region->guest_phys_addr),
-		cpu_to_fdt64(region->info.size),
-	};
+	u64 *reg_prop;
+	u32 *irq_prop = NULL;
+	unsigned int i, nr_regions = 0, nr_irqs = 0;
+
+	(void)irq_fn;
 
 	name = name ? name + 1 : "vfio-platform";
 	snprintf(dev_name, sizeof(dev_name), "%s@%llx", name,
 		 region->guest_phys_addr);
 
+	for (i = 0; i < vdev->info.num_regions; i++) {
+		if (vdev->regions[i].vdev)
+			nr_regions++;
+	}
+
+	reg_prop = calloc(nr_regions * 2, sizeof(*reg_prop));
+	if (!reg_prop)
+		die_perror("calloc");
+
+	nr_regions = 0;
+	for (i = 0; i < vdev->info.num_regions; i++) {
+		region = &vdev->regions[i];
+		if (!region->vdev)
+			continue;
+
+		reg_prop[nr_regions * 2] =
+			cpu_to_fdt64(region->guest_phys_addr);
+		reg_prop[nr_regions * 2 + 1] =
+			cpu_to_fdt64(region->info.size);
+		nr_regions++;
+	}
+
+	for (i = 0; i < pdev->num_irqs; i++) {
+		if (pdev->irqs[i].irq_fd >= 0)
+			nr_irqs++;
+	}
+
+	if (nr_irqs) {
+		irq_prop = calloc(nr_irqs * 3, sizeof(*irq_prop));
+		if (!irq_prop)
+			die_perror("calloc");
+
+		nr_irqs = 0;
+		for (i = 0; i < pdev->num_irqs; i++) {
+			struct vfio_platform_irq *irq = &pdev->irqs[i];
+
+			if (irq->irq_fd < 0)
+				continue;
+
+			irq_prop[nr_irqs * 3] = cpu_to_fdt32(0);
+			irq_prop[nr_irqs * 3 + 1] =
+				cpu_to_fdt32(irq->guest_irq - KVM_IRQ_OFFSET);
+			irq_prop[nr_irqs * 3 + 2] =
+				cpu_to_fdt32(IRQ_TYPE_LEVEL_HIGH);
+			nr_irqs++;
+		}
+	}
+
 	_FDT(fdt_begin_node(fdt, dev_name));
 	_FDT(fdt_property(fdt, "compatible", pdev->compatible,
 			  pdev->compatible_len));
-	_FDT(fdt_property(fdt, "reg", reg_prop, sizeof(reg_prop)));
+	_FDT(fdt_property(fdt, "reg", reg_prop,
+			  nr_regions * 2 * sizeof(*reg_prop)));
 	_FDT(fdt_property(fdt, "dma-coherent", NULL, 0));
 
-	if (pdev->irq_fd >= 0)
-		irq_fn(fdt, pdev->gsi + KVM_IRQ_OFFSET,
-		       IRQ_TYPE_LEVEL_HIGH);
+	if (nr_irqs) {
+		_FDT(fdt_property(fdt, "interrupts", irq_prop,
+				  nr_irqs * 3 * sizeof(*irq_prop)));
+
+		if (pdev->irq_names)
+			_FDT(fdt_property(fdt, "interrupt-names",
+					  pdev->irq_names,
+					  pdev->irq_names_len));
+	}
 
 	_FDT(fdt_end_node(fdt));
+
+	free(irq_prop);
+	free(reg_prop);
 }
 #else
 #define vfio_platform_generate_fdt	NULL
@@ -121,7 +202,12 @@ static void vfio_platform_unmap_regions(struct kvm *kvm,
 		vfio_unmap_region(kvm, &vdev->regions[i]);
 	}
 }
-
+/*
+	把 VFIO platform 设备暴露出来的每个 MMIO region，查询出来，
+	然后分配一个 guest 物理地址，并映射进虚拟机地址空间。
+	kvm:表示当前虚拟机实例。
+	vdev:表示一个已经通过 VFIO 打开的设备，比如你的 NPU platform 设备。
+*/
 static int vfio_platform_configure_regions(struct kvm *kvm,
 					   struct vfio_device *vdev)
 {
@@ -129,11 +215,8 @@ static int vfio_platform_configure_regions(struct kvm *kvm,
 	unsigned int i;
 	int ret, mapped = 0;
 
-
-
 	for (i = 0; i < vdev->info.num_regions; i++) {
 		struct vfio_region *region = &vdev->regions[i];
-
 		/*
 			argsz: 我传进去的结构体大小
 			index: 我要查询第几个 region
@@ -212,138 +295,213 @@ err_unmap_regions:
 static void vfio_platform_disable_irq(struct kvm *kvm, struct vfio_device *vdev)
 {
 	struct vfio_platform_device *pdev = &vdev->platform;
-	union vfio_irq_eventfd unmask;
-	struct vfio_irq_set irq_set = {
-		.argsz	= sizeof(irq_set),
-		.flags	= VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
-		.index	= pdev->irq_info.index,
-	};
+	unsigned int i;
 
-	if (pdev->irq_fd < 0)
+	if (!pdev->irqs)
 		return;
 
-	ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &irq_set);
-
-	if (pdev->unmask_fd >= 0) {
-		unmask.irq = (struct vfio_irq_set) {
-			.argsz	= sizeof(unmask),
-			.flags	= VFIO_IRQ_SET_DATA_EVENTFD |
-				  VFIO_IRQ_SET_ACTION_UNMASK,
-			.index	= pdev->irq_info.index,
+	for (i = 0; i < pdev->num_irqs; i++) {
+		struct vfio_platform_irq *irq = &pdev->irqs[i];
+		union vfio_irq_eventfd unmask;
+		struct vfio_irq_set irq_set = {
+			.argsz	= sizeof(irq_set),
+			.flags	= VFIO_IRQ_SET_DATA_NONE |
+				  VFIO_IRQ_SET_ACTION_TRIGGER,
+			.index	= irq->info.index,
 			.start	= 0,
-			.count	= 1,
+			.count	= 0,
 		};
-		set_vfio_irq_eventfd_payload(&unmask, -1);
-		ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &unmask);
-		close(pdev->unmask_fd);
-		pdev->unmask_fd = -1;
+
+		if (irq->irq_fd < 0)
+			continue;
+
+		ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &irq_set);
+
+		if (irq->unmask_fd >= 0) {
+			unmask.irq = (struct vfio_irq_set) {
+				.argsz	= sizeof(unmask),
+				.flags	= VFIO_IRQ_SET_DATA_EVENTFD |
+					  VFIO_IRQ_SET_ACTION_UNMASK,
+				.index	= irq->info.index,
+				.start	= 0,
+				.count	= 1,
+			};
+			set_vfio_irq_eventfd_payload(&unmask, -1);
+			ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &unmask);
+			close(irq->unmask_fd);
+			irq->unmask_fd = -1;
+		}
+
+		if (irq->irqfd_added) {
+			irq__del_irqfd(kvm, irq->gsi, irq->irq_fd);
+			irq->irqfd_added = 0;
+		}
+		close(irq->irq_fd);
+		irq->irq_fd = -1;
 	}
 
-	irq__del_irqfd(kvm, pdev->gsi, pdev->irq_fd);
-	close(pdev->irq_fd);
-	pdev->irq_fd = -1;
+	free(pdev->irqs);
+	pdev->irqs = NULL;
+	pdev->num_irqs = 0;
 }
 
+
+/*
+irq->irq_fd = eventfd(0, 0)
+        |
+        +--> irq__add_irqfd()
+        |      告诉 KVM：这个 fd 被 signal 时，向 guest 注入 GIC IRQ
+        |
+        +--> VFIO_DEVICE_SET_IRQS ACTION_TRIGGER
+               告诉 VFIO：真实设备 IRQ 来了，signal 这个 fd
+*/
 static int vfio_platform_init_irq(struct kvm *kvm, struct vfio_device *vdev)
 {
 	struct vfio_platform_device *pdev = &vdev->platform;
-	union vfio_irq_eventfd trigger;
-	union vfio_irq_eventfd unmask;
-	int irq_line, trigger_fd, unmask_fd = -1;
+	unsigned int i;
 	int ret;
 
-	pdev->irq_info = (struct vfio_irq_info) {
-		.argsz	= sizeof(pdev->irq_info),
-		.index	= 0,
-	};
-
-	ret = ioctl(vdev->fd, VFIO_DEVICE_GET_IRQ_INFO, &pdev->irq_info);
-	if (ret || pdev->irq_info.count == 0) {
-		vfio_dev_warn(vdev, "no platform IRQ reported by VFIO");
+	pdev->num_irqs = vdev->info.num_irqs;
+	if (!pdev->num_irqs)
 		return 0;
-	}
 
-	if (!(pdev->irq_info.flags & VFIO_IRQ_INFO_EVENTFD)) {
-		vfio_dev_err(vdev, "platform IRQ is not eventfd capable");
-		return -EINVAL;
-	}
+	pdev->irqs = calloc(pdev->num_irqs, sizeof(*pdev->irqs));
+	if (!pdev->irqs)
+		return -ENOMEM;
 
-	irq_line = irq__alloc_line();
-	pdev->gsi = irq_line - KVM_IRQ_OFFSET;
+	/*
+		这里的框架和region是一样的，都是先获取region->info,再对每个region信息进行查询
+		irq->info也是一样
+	*/
+	for (i = 0; i < pdev->num_irqs; i++) {
+		struct vfio_platform_irq *irq = &pdev->irqs[i];
+		union vfio_irq_eventfd trigger;
+		union vfio_irq_eventfd unmask;
+		int irq_line;
 
-	trigger_fd = eventfd(0, 0);
-	if (trigger_fd < 0) {
-		vfio_dev_err(vdev, "failed to create trigger eventfd");
-		return trigger_fd;
-	}
+		irq->irq_fd = -1;
+		irq->unmask_fd = -1;
 
-	if (pdev->irq_info.flags & VFIO_IRQ_INFO_MASKABLE) {
-		unmask_fd = eventfd(0, 0);
-		if (unmask_fd < 0) {
-			vfio_dev_err(vdev, "failed to create unmask eventfd");
-			ret = unmask_fd;
-			goto err_close_trigger;
-		}
-	}
-
-	ret = irq__add_irqfd(kvm, pdev->gsi, trigger_fd, unmask_fd);
-	if (ret)
-		goto err_close_unmask;
-
-	trigger.irq = (struct vfio_irq_set) {
-		.argsz	= sizeof(trigger),
-		.flags	= VFIO_IRQ_SET_DATA_EVENTFD |
-			  VFIO_IRQ_SET_ACTION_TRIGGER,
-		.index	= pdev->irq_info.index,
-		.start	= 0,
-		.count	= 1,
-	};
-	set_vfio_irq_eventfd_payload(&trigger, trigger_fd);
-
-	ret = ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &trigger);
-	if (ret) {
-		vfio_dev_err(vdev, "failed to setup platform IRQ trigger");
-		goto err_del_irqfd;
-	}
-
-	if (unmask_fd >= 0) {
-		unmask.irq = (struct vfio_irq_set) {
-			.argsz	= sizeof(unmask),
-			.flags	= VFIO_IRQ_SET_DATA_EVENTFD |
-				  VFIO_IRQ_SET_ACTION_UNMASK,
-			.index	= pdev->irq_info.index,
-			.start	= 0,
-			.count	= 1,
+		irq->info = (struct vfio_irq_info) {
+			.argsz = sizeof(irq->info),
+			.index = i,
 		};
-		set_vfio_irq_eventfd_payload(&unmask, unmask_fd);
 
-		ret = ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &unmask);
+		ret = ioctl(vdev->fd, VFIO_DEVICE_GET_IRQ_INFO, &irq->info);
 		if (ret) {
-			vfio_dev_err(vdev, "failed to setup platform IRQ unmask");
-			goto err_unset_trigger;
+			vfio_dev_err(vdev,
+				     "failed to get platform IRQ %u info: errno=%d (%s)",
+				     i, errno, strerror(errno));
+			continue;
 		}
+
+		vfio_dev_info(vdev,
+			      "platform IRQ %u info flags=0x%x count=%u",
+			      i, irq->info.flags, irq->info.count);
+
+		if (irq->info.count == 0)
+			continue;
+
+		if (!(irq->info.flags & VFIO_IRQ_INFO_EVENTFD)) {
+			vfio_dev_err(vdev, "platform IRQ %u is not eventfd capable", i);
+			ret = -EINVAL;
+			goto err_disable_irqs;
+		}
+		/*
+			这里是分配guest的中断号
+		*/
+		irq_line = irq__alloc_line();
+		irq->guest_irq = irq_line;
+		irq->gsi = irq_line - KVM_IRQ_OFFSET;
+
+		/*
+			把真实硬件中断转换成 KVM guest 中断注入。KVM监听这个event
+			KVM，你以后监听 irq->irq_fd。只要这个 fd 被 signal，就给 guest 注入 irq->gsi 这个中断。
+		*/
+		irq->irq_fd = eventfd(0, 0);
+		if (irq->irq_fd < 0) {
+			ret = -errno;
+			vfio_dev_err(vdev,
+				     "failed to create platform IRQ %u trigger eventfd: errno=%d (%s)",
+				     i, errno, strerror(errno));
+			goto err_disable_irqs;
+		}
+
+		if (irq->info.flags & VFIO_IRQ_INFO_MASKABLE) {
+			irq->unmask_fd = eventfd(0, 0);
+			if (irq->unmask_fd < 0) {
+				ret = -errno;
+				vfio_dev_err(vdev,
+					     "failed to create platform IRQ %u unmask eventfd: errno=%d (%s)",
+					     i, errno, strerror(errno));
+				goto err_disable_irqs;
+			}
+		}
+
+		ret = irq__add_irqfd(kvm, irq->gsi, irq->irq_fd,
+				     irq->unmask_fd);
+		if (ret) {
+			vfio_dev_err(vdev,
+				     "failed to add irqfd for platform IRQ %u guest IRQ %d: ret=%d",
+				     i, irq_line, ret);
+			goto err_disable_irqs;
+		}
+		irq->irqfd_added = 1;
+
+
+		/*
+			VFIO，你以后把 host 真实硬件 IRQ 绑定到 irq->irq_fd。
+			真实 NPU IRQ 来了，就 signal 这个 eventfd。
+		*/
+		trigger.irq = (struct vfio_irq_set) {
+			.argsz = sizeof(trigger),
+			.flags = VFIO_IRQ_SET_DATA_EVENTFD |
+				 VFIO_IRQ_SET_ACTION_TRIGGER,
+
+			//这里就是绑定了硬件中断号和事件
+			.index = irq->info.index,
+			.start = 0,
+			.count = 1,
+		};
+		set_vfio_irq_eventfd_payload(&trigger, irq->irq_fd);
+		ret = ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &trigger);
+		if (ret) {
+			ret = -errno;
+			vfio_dev_err(vdev,
+				     "failed to setup platform IRQ %u trigger: errno=%d (%s)",
+				     i, errno, strerror(errno));
+			goto err_disable_irqs;
+		}
+
+		if (irq->unmask_fd >= 0) {
+			unmask.irq = (struct vfio_irq_set) {
+				.argsz = sizeof(unmask),
+				.flags = VFIO_IRQ_SET_DATA_EVENTFD |
+					 VFIO_IRQ_SET_ACTION_UNMASK,
+				.index = irq->info.index,
+				.start = 0,
+				.count = 1,
+			};
+			set_vfio_irq_eventfd_payload(&unmask, irq->unmask_fd);
+
+			ret = ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &unmask);
+			if (ret) {
+				ret = -errno;
+				vfio_dev_err(vdev,
+					     "failed to setup platform IRQ %u unmask: errno=%d (%s)",
+					     i, errno, strerror(errno));
+				goto err_disable_irqs;
+			}
+		}
+
+		vfio_dev_info(vdev, "mapped platform IRQ %u to guest IRQ %d",
+			      i, irq_line);
 	}
-
-	pdev->irq_fd = trigger_fd;
-	pdev->unmask_fd = unmask_fd;
-
-	vfio_dev_info(vdev, "mapped platform IRQ to guest IRQ %d",
-		      irq_line);
 
 	return 0;
 
-err_unset_trigger:
-	trigger.irq.flags = VFIO_IRQ_SET_DATA_NONE |
-			    VFIO_IRQ_SET_ACTION_TRIGGER;
-	trigger.irq.count = 0;
-	ioctl(vdev->fd, VFIO_DEVICE_SET_IRQS, &trigger);
-err_del_irqfd:
-	irq__del_irqfd(kvm, pdev->gsi, trigger_fd);
-err_close_unmask:
-	if (unmask_fd >= 0)
-		close(unmask_fd);
-err_close_trigger:
-	close(trigger_fd);
+err_disable_irqs:
+	vfio_platform_disable_irq(kvm, vdev);
 	return ret;
 }
 
@@ -351,9 +509,6 @@ int vfio_platform_setup_device(struct kvm *kvm, struct vfio_device *vdev)
 {
 	int ret;
 	struct vfio_platform_device *pdev = &vdev->platform;
-
-	pdev->irq_fd = -1;
-	pdev->unmask_fd = -1;
 
 	ret = vfio_platform_configure_regions(kvm, vdev);
 	if (ret)
@@ -367,6 +522,12 @@ int vfio_platform_setup_device(struct kvm *kvm, struct vfio_device *vdev)
 	if (ret) {
 		vfio_dev_err(vdev, "failed to read platform compatible");
 		goto err_disable_irq;
+	}
+
+	ret = vfio_platform_read_irq_names(vdev);
+	if (ret) {
+		vfio_dev_err(vdev, "failed to read platform interrupt names");
+		goto err_free_compatible;
 	}
 
 	vdev->dev_hdr = (struct device_header) {
@@ -386,6 +547,9 @@ int vfio_platform_setup_device(struct kvm *kvm, struct vfio_device *vdev)
 	return 0;
 
 err_free_compatible:
+	free(pdev->irq_names);
+	pdev->irq_names = NULL;
+	pdev->irq_names_len = 0;
 	free(pdev->compatible);
 	pdev->compatible = NULL;
 err_disable_irq:
@@ -400,5 +564,6 @@ void vfio_platform_teardown_device(struct kvm *kvm, struct vfio_device *vdev)
 	vfio_platform_disable_irq(kvm, vdev);
 	vfio_platform_unmap_regions(kvm, vdev);
 	device__unregister(&vdev->dev_hdr);
+	free(vdev->platform.irq_names);
 	free(vdev->platform.compatible);
 }

@@ -436,7 +436,7 @@ int gic__add_irqfd(struct kvm *kvm, unsigned int gsi, int trigger_fd,
 		   int resample_fd)
 {
 	struct kvm_irqfd_line *line;
-
+	
 	if (vgic_is_init)
 		return irq__common_add_irqfd(kvm, gsi, trigger_fd, resample_fd);
 

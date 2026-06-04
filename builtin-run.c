@@ -12,6 +12,7 @@
 #include "kvm/virtio-blk.h"
 #include "kvm/virtio-net.h"
 #include "kvm/virtio-rng.h"
+#include "kvm/virtio-npu.h"
 #include "kvm/ioeventfd.h"
 #include "kvm/virtio-9p.h"
 #include "kvm/barrier.h"
@@ -206,6 +207,8 @@ static int loglevel_parser(const struct option *opt, const char *arg, int unset)
 	OPT_BOOLEAN('\0', "sdl", &(cfg)->sdl, "Enable SDL framebuffer"),\
 	OPT_BOOLEAN('\0', "rng", &(cfg)->virtio_rng, "Enable virtio"	\
 			" Random Number Generator"),			\
+	OPT_BOOLEAN('\0', "virtio-npu", &(cfg)->virtio_npu, "Enable"	\
+			" experimental virtio NPU device"),		\
 	OPT_BOOLEAN('\0', "nodefaults", &(cfg)->nodefaults, "Disable"   \
 			" implicit configuration that cannot be"	\
 			" disabled otherwise"),				\

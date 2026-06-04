@@ -172,7 +172,6 @@ static size_t get_config_size(struct kvm *kvm, void *dev)
 static u64 get_host_features(struct kvm *kvm, void *dev)
 {
 	struct blk_dev *bdev = dev;
-
 	return	1UL << VIRTIO_BLK_F_SEG_MAX
 		| 1UL << VIRTIO_BLK_F_FLUSH
 		| 1UL << VIRTIO_RING_F_EVENT_IDX

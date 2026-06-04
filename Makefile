@@ -72,6 +72,7 @@ OBJS	+= virtio/console.o
 OBJS	+= virtio/core.o
 OBJS	+= virtio/net.o
 OBJS	+= virtio/rng.o
+OBJS	+= virtio/npu.o
 OBJS    += virtio/balloon.o
 OBJS	+= virtio/pci.o
 OBJS	+= virtio/vsock.o

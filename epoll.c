@@ -10,6 +10,8 @@ static void *epoll__thread(void *param)
 	int nfds, i;
 	struct kvm__epoll *epoll = param;
 	struct kvm *kvm = epoll->kvm;
+
+	
 	struct epoll_event events[EPOLLFD_MAX_EVENTS];
 
 	kvm__set_thread_name(epoll->name);

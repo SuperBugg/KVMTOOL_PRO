@@ -84,18 +84,30 @@ struct vfio_pci_device {
 	struct vfio_pci_msix_pba	msix_pba;
 };
 
+struct vfio_platform_irq {
+	int irq_fd;
+	int unmask_fd;
+	int irqfd_added;
+	unsigned int gsi;
+	unsigned int guest_irq;
+	struct vfio_irq_info info;
+};
+
+
 /*
-	中断
+	中断 + compatible
 */
 struct vfio_platform_device {
-	int				irq_fd;
-	int				unmask_fd;
-	unsigned int			gsi;
-	struct vfio_irq_info		irq_info;
+	struct vfio_platform_irq *irqs;
+	unsigned int num_irqs;
 	char				*compatible;
 	size_t				compatible_len;
+	char				*irq_names;
+	size_t				irq_names_len;
 	unsigned int			fdt_region_index;
 };
+
+
 
 struct vfio_region {
 	struct vfio_region_info		info;

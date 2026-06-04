@@ -303,6 +303,7 @@ static int vfio_configure_device(struct kvm *kvm, struct vfio_device *vdev)
 	int ret;
 	struct vfio_group *group = vdev->group;
 
+	vfio_dev_info(vdev, "CHJ vfio: GET_DEVICE_FD enter");
 	vdev->fd = ioctl(group->fd, VFIO_GROUP_GET_DEVICE_FD,
 			 vdev->params->name);
 	if (vdev->fd < 0) {
@@ -311,17 +312,27 @@ static int vfio_configure_device(struct kvm *kvm, struct vfio_device *vdev)
 		/* The device might be a bridge without an fd */
 		return 0;
 	}
+	vfio_dev_info(vdev, "CHJ vfio: GET_DEVICE_FD ok");
 
 	vdev->info.argsz = sizeof(vdev->info);
+	vfio_dev_info(vdev, "CHJ vfio: DEVICE_GET_INFO enter");
 	if (ioctl(vdev->fd, VFIO_DEVICE_GET_INFO, &vdev->info)) {
 		ret = -errno;
 		vfio_dev_err(vdev, "failed to get info");
 		goto err_close_device;
 	}
+	vfio_dev_info(vdev,
+		      "CHJ vfio: DEVICE_GET_INFO ok flags=0x%x regions=%u irqs=%u",
+		      vdev->info.flags, vdev->info.num_regions,
+		      vdev->info.num_irqs);
 
-	if (vdev->info.flags & VFIO_DEVICE_FLAGS_RESET &&
-	    ioctl(vdev->fd, VFIO_DEVICE_RESET) < 0)
-		vfio_dev_warn(vdev, "failed to reset device");
+	if (vdev->info.flags & VFIO_DEVICE_FLAGS_RESET) {
+		vfio_dev_info(vdev, "CHJ vfio: DEVICE_RESET enter");
+		if (ioctl(vdev->fd, VFIO_DEVICE_RESET) < 0)
+			vfio_dev_warn(vdev, "failed to reset device");
+		else
+			vfio_dev_info(vdev, "CHJ vfio: DEVICE_RESET ok");
+	}
 
 	vdev->regions = calloc(vdev->info.num_regions, sizeof(*vdev->regions));
 	if (!vdev->regions) {
@@ -333,11 +344,15 @@ static int vfio_configure_device(struct kvm *kvm, struct vfio_device *vdev)
 	switch (vdev->params->type) {
 	case VFIO_DEVICE_PCI:
 		BUG_ON(!(vdev->info.flags & VFIO_DEVICE_FLAGS_PCI));
+		vfio_dev_info(vdev, "CHJ vfio: pci setup enter");
 		ret = vfio_pci_setup_device(kvm, vdev);
+		vfio_dev_info(vdev, "CHJ vfio: pci setup ret=%d", ret);
 		break;
 	case VFIO_DEVICE_PLATFORM:
 		BUG_ON(!(vdev->info.flags & VFIO_DEVICE_FLAGS_PLATFORM));
+		vfio_dev_info(vdev, "CHJ vfio: platform setup enter");
 		ret = vfio_platform_setup_device(kvm, vdev);
+		vfio_dev_info(vdev, "CHJ vfio: platform setup ret=%d", ret);
 		break;
 	default:
 		BUG_ON(1);
@@ -396,10 +411,15 @@ static int vfio_map_mem_bank(struct kvm *kvm, struct kvm_mem_bank *bank, void *d
 	};
 
 	/* Map the guest memory for DMA (i.e. provide isolation) */
+	pr_info("CHJ vfio: MAP_DMA enter iova=0x%llx vaddr=0x%llx size=0x%llx",
+		dma_map.iova, dma_map.vaddr, dma_map.size);
 	if (ioctl(vfio_container, VFIO_IOMMU_MAP_DMA, &dma_map)) {
 		ret = -errno;
 		pr_err("Failed to map 0x%llx -> 0x%llx (%llu) for DMA",
 		       dma_map.iova, dma_map.vaddr, dma_map.size);
+	} else {
+		pr_info("CHJ vfio: MAP_DMA ok iova=0x%llx size=0x%llx",
+			dma_map.iova, dma_map.size);
 	}
 
 	return ret;
@@ -483,26 +503,33 @@ static struct vfio_group *vfio_group_create(struct kvm *kvm, unsigned long id)
 	if (ret < 0 || ret == PATH_MAX)
 		goto err_free_group;
 
+	pr_info("CHJ vfio: group %lu open enter", id);
 	group->fd = open(group_node, O_RDWR);
 	if (group->fd < 0) {
 		pr_err("Failed to open IOMMU group %s", group_node);
 		goto err_free_group;
 	}
+	pr_info("CHJ vfio: group %lu open ok", id);
 
+	pr_info("CHJ vfio: group %lu GET_STATUS enter", id);
 	if (ioctl(group->fd, VFIO_GROUP_GET_STATUS, &group_status)) {
 		pr_err("Failed to determine status of IOMMU group %lu", id);
 		goto err_close_group;
 	}
+	pr_info("CHJ vfio: group %lu GET_STATUS ok flags=0x%x", id,
+		group_status.flags);
 
 	if (!(group_status.flags & VFIO_GROUP_FLAGS_VIABLE)) {
 		pr_err("IOMMU group %lu is not viable", id);
 		goto err_close_group;
 	}
 
+	pr_info("CHJ vfio: group %lu SET_CONTAINER enter", id);
 	if (ioctl(group->fd, VFIO_GROUP_SET_CONTAINER, &vfio_container)) {
 		pr_err("Failed to add IOMMU group %lu to VFIO container", id);
 		goto err_close_group;
 	}
+	pr_info("CHJ vfio: group %lu SET_CONTAINER ok", id);
 
 	list_add(&group->list, &vfio_groups);
 
@@ -650,12 +677,19 @@ static int vfio_container_init(struct kvm *kvm)
 	for (i = 0; i < kvm->cfg.num_vfio_devices; ++i) {
 		vfio_devices[i].params = &kvm->cfg.vfio_devices[i];
 
+		pr_info("CHJ vfio: device init enter %s/%s",
+			vfio_devices[i].params->bus,
+			vfio_devices[i].params->name);
 		ret = vfio_device_init(kvm, &vfio_devices[i]);
 		if (ret)
 			return ret;
+		pr_info("CHJ vfio: device init ok %s/%s",
+			vfio_devices[i].params->bus,
+			vfio_devices[i].params->name);
 	}
 
 	/* Finalise the container */
+	pr_info("CHJ vfio: SET_IOMMU enter type=%d", iommu_type);
 	if (ioctl(vfio_container, VFIO_SET_IOMMU, iommu_type)) {
 		ret = -errno;
 		pr_err("Failed to set IOMMU type %d for VFIO container",
@@ -663,8 +697,10 @@ static int vfio_container_init(struct kvm *kvm)
 		return ret;
 	} else {
 		pr_info("Using IOMMU type %d for VFIO container", iommu_type);
+		pr_info("CHJ vfio: SET_IOMMU ok type=%d", iommu_type);
 	}
 
+	pr_info("CHJ vfio: map all RAM banks enter");
 	return kvm__for_each_mem_bank(kvm, KVM_MEM_TYPE_RAM, vfio_map_mem_bank,
 				      NULL);
 }
@@ -683,14 +719,17 @@ static int vfio__init(struct kvm *kvm)
 	ret = vfio_container_init(kvm);
 	if (ret)
 		return ret;
+	pr_info("CHJ vfio: container init ok");
 
 	ret = vfio_configure_groups(kvm);
 	if (ret)
 		return ret;
+	pr_info("CHJ vfio: configure groups ok");
 
 	ret = vfio_configure_devices(kvm);
 	if (ret)
 		return ret;
+	pr_info("CHJ vfio: configure devices ok");
 
 	return 0;
 }

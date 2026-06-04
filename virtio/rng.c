@@ -117,6 +117,7 @@ static int init_vq(struct kvm *kvm, void *dev, u32 vq)
 		.rdev	= rdev,
 	};
 
+	//
 	thread_pool__init_job(&job->job_id, kvm, virtio_rng_do_io, job);
 
 	return 0;

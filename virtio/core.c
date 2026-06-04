@@ -71,6 +71,8 @@ virt_queue__set_used_elem_no_update(struct virt_queue *queue, u32 head,
 				    u32 len, u16 offset)
 {
 	struct vring_used_elem *used_elem;
+
+	//先读当前used ring写入的位置
 	u16 idx = virtio_guest_to_host_u16(queue->endian, queue->vring.used->idx);
 
 	idx += offset;
@@ -87,6 +89,7 @@ struct vring_used_elem *virt_queue__set_used_elem(struct virt_queue *queue, u32 
 
 	used_elem = virt_queue__set_used_elem_no_update(queue, head, len, 0);
 	virt_queue__used_idx_advance(queue, 1);
+
 
 	return used_elem;
 }
