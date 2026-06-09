@@ -13,10 +13,15 @@
 
 #define VIRTIO_NPU_CMD_GET_INFO		1
 #define VIRTIO_NPU_CMD_PING		2
+#define VIRTIO_NPU_CMD_INFER_DUMMY	3
+#define VIRTIO_NPU_CMD_INFER_RAW	4
+
 
 #define VIRTIO_NPU_STATUS_OK		0
 #define VIRTIO_NPU_STATUS_UNSUPP	1
 #define VIRTIO_NPU_STATUS_BAD_REQ	2
+#define VIRTIO_NPU_STATUS_IOERR		3
+
 
 struct virtio_npu_req {
 	__le32 cmd;
