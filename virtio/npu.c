@@ -8,6 +8,7 @@
 #include <linux/list.h>
 #include <linux/virtio_npu.h>
 #include <string.h>
+#include <dlfcn.h>
 
 #define NUM_VIRT_QUEUES	1
 
@@ -25,9 +26,30 @@ struct npu_dev {
 		backend_data:
 		后端自己的私有数据
 	*/
+	struct kvm *kvm;
 	const struct virtio_npu_backend_ops *backend_ops;
 	void *backend_data;
 };
+
+struct virtio_npu_rknn_backend;
+
+struct virtio_npu_rknn_data {
+
+	//动态库？打开的 librknn_backend.so
+	void *dl_handle;
+	//模型上下文
+	struct virtio_npu_rknn_backend *backend;
+
+	int(*create)(const char *model_path, struct virtio_npu_rknn_backend **out);
+	void(*destroy)(struct virtio_npu_rknn_backend *backend);
+	int(*infer_raw)(struct virtio_npu_rknn_backend *backend,
+				const void *input, size_t input_len,
+				void *output, size_t output_len,
+				u32 *actual_output_len);
+
+	int(*create_from_buffer)(const void *model_data, size_t model_len, struct virtio_npu_rknn_backend **out);
+};
+
 
 struct virtio_npu_backend_result {
 	u32 status;
@@ -45,6 +67,119 @@ struct virtio_npu_backend_ops {
 };
 
 static LIST_HEAD(ndevs);
+
+static struct virtio_npu_rknn_data *virtio_npu_rknn_open(void)
+{
+	struct virtio_npu_rknn_data *data;
+
+	data = calloc(1, sizeof(*data));
+	if (!data)
+		return NULL;
+
+	data->dl_handle = dlopen("./virtio-npu-rknn/librknn_backend.so", RTLD_NOW);
+	if (!data->dl_handle) {
+		pr_warning("virtio-npu: failed to dlopen RKNN backend: %s", dlerror());
+		free(data);
+		return NULL;
+	}
+
+	//从动态库里拿到函数指针
+	/*
+		create: 根据模型文件路径创建 RKNN 后端实例,模型在 host 文件系统里
+	*/
+	data->create = dlsym(data->dl_handle, "virtio_npu_rknn_backend_create");
+	data->destroy = dlsym(data->dl_handle, "virtio_npu_rknn_backend_destroy");
+	data->infer_raw = dlsym(data->dl_handle, "virtio_npu_rknn_backend_infer_raw");
+	/*
+		create_from_buffer: 模型已经在内存里
+	*/
+	data->create_from_buffer =
+		dlsym(data->dl_handle, "virtio_npu_rknn_backend_create_from_buffer");
+
+	if (!data->create || !data->destroy || !data->infer_raw ||
+	    !data->create_from_buffer) {
+		pr_warning("virtio-npu: missing RKNN backend symbols");
+		dlclose(data->dl_handle);
+		free(data);
+		return NULL;
+	}
+
+	return data;
+}
+
+static int virtio_npu_rknn_init(struct npu_dev *ndev)
+{
+	const char *model = ndev->kvm->cfg.virtio_npu_model;
+	struct virtio_npu_rknn_data *data;
+	int ret;
+
+	if(!model)
+		return -EINVAL;
+
+	data = virtio_npu_rknn_open();
+	if (!data)
+		return -ENOMEM;
+
+	ret = data->create(model, &data->backend);
+	if (ret) {
+		pr_warning("virtio-npu: failed to create RKNN backend: %d", ret);
+		dlclose(data->dl_handle);
+		free(data);
+		return ret;
+	}
+
+	ndev->backend_data = data;
+	return 0;
+}
+static struct virtio_npu_backend_result
+virtio_npu_rknn_infer(struct npu_dev *ndev, const void *input,
+		      size_t input_len, void *output, size_t output_len)
+{
+	struct virtio_npu_rknn_data *data = ndev->backend_data;
+
+	struct virtio_npu_backend_result result = {
+		.status = VIRTIO_NPU_STATUS_OK,
+	};
+
+	u32 actual_len = 0;
+	int ret;
+
+	if (!data || !data->infer_raw) {
+		result.status = VIRTIO_NPU_STATUS_IOERR;
+		return result;
+	}
+
+	ret = data->infer_raw(data->backend, input, input_len,
+			      output, output_len, &actual_len);
+	if (ret) {
+		result.status = VIRTIO_NPU_STATUS_IOERR;
+		return result;
+	}
+	result.actual_output_len = actual_len;
+	return result;
+}
+static void virtio_npu_rknn_exit(struct npu_dev *ndev)
+{
+	struct virtio_npu_rknn_data *data = ndev->backend_data;
+
+	if (!data)
+		return;
+
+	if (data->destroy && data->backend)
+		data->destroy(data->backend);
+
+	if (data->dl_handle)
+		dlclose(data->dl_handle);
+
+	free(data);
+	ndev->backend_data = NULL;
+}
+static const struct virtio_npu_backend_ops virtio_npu_rknn_ops = {
+	.init = virtio_npu_rknn_init,
+	.exit = virtio_npu_rknn_exit,
+	.infer = virtio_npu_rknn_infer,
+};
+
 
 
 static u8 *get_config(struct kvm *kvm, void *dev)
@@ -137,13 +272,12 @@ virtio_npu_dummy_infer(struct npu_dev *ndev, const void *input,
 	return result;
 }
 
-
-
 static const struct virtio_npu_backend_ops virtio_npu_dummy_ops = {
 	.infer = virtio_npu_dummy_infer,
 };
 
 static size_t virtio_npu_do_infer_common(struct npu_dev *ndev,
+					const struct virtio_npu_backend_ops *ops,
 					struct virt_queue *vq,
 					struct iovec out_iov[], u16 out,
 					struct iovec in_iov[], u16 in,
@@ -154,7 +288,7 @@ static size_t virtio_npu_do_infer_common(struct npu_dev *ndev,
 	struct virtio_npu_backend_result result;
 	char *guest_input;
 	char *guest_output;
-	
+
 	if (out < 2 || in < 2)
 		return 0;
 
@@ -189,11 +323,106 @@ static size_t virtio_npu_do_infer_common(struct npu_dev *ndev,
 	guest_input = out_iov[1].iov_base;
 	guest_output = in_iov[1].iov_base;
 
-	result = ndev->backend_ops->infer(ndev, guest_input, input_len,
-					  guest_output, output_len);
+	if (!ops || !ops->infer)
+		return virtio_npu_write_resp(vq, in_iov, in,
+					     VIRTIO_NPU_STATUS_IOERR, 0);
+
+	result = ops->infer(ndev, guest_input, input_len,
+			    guest_output, output_len);
 	return virtio_npu_write_resp(vq, in_iov, in,
 				    result.status, result.actual_output_len);
 }
+
+
+
+
+
+static int virtio_npu_load_model_from_buffer(struct npu_dev *ndev,
+					     const void *model,
+					     size_t model_len)
+{
+	struct virtio_npu_rknn_data *olddata;
+	struct virtio_npu_rknn_data *data;
+	int ret;
+
+	if (!ndev || !model || !model_len)
+		return -EINVAL;
+
+	data = virtio_npu_rknn_open();
+	if (!data)
+		return -ENOMEM;
+
+	ret = data->create_from_buffer(model, model_len, &data->backend);
+	if (ret) {
+		pr_warning("virtio-npu: failed to create RKNN backend from uploaded model: %d",
+			   ret);
+		if (data->dl_handle)
+			dlclose(data->dl_handle);
+		free(data);
+		return ret;
+	}
+
+	olddata = ndev->backend_data;
+	ndev->backend_data = data;
+	ndev->backend_ops = &virtio_npu_rknn_ops;
+	if (olddata) {
+		if (olddata->destroy && olddata->backend)
+			olddata->destroy(olddata->backend);
+
+		if (olddata->dl_handle)
+			dlclose(olddata->dl_handle);
+
+		free(olddata);
+	}
+	return 0;
+
+}
+/*
+	out = 2
+	in = 1
+*/
+static size_t virtio_npu_do_load_model(struct npu_dev *ndev,
+					struct virt_queue *vq,
+					struct iovec out_iov[], u16 out,
+					struct iovec in_iov[], u16 in,
+					struct virtio_npu_req *req)
+{
+	u32 model_len;
+	void *model_data;
+	int ret;
+	if (out < 2 || in < 1)
+		return 0;
+	//检查请求头
+	if(!out_iov[0].iov_base || out_iov[0].iov_len < sizeof(struct virtio_npu_req))
+		return 0;
+	//检查模型数据
+	if (!out_iov[1].iov_base || !out_iov[1].iov_len)
+		return virtio_npu_write_resp(vq, in_iov, in,
+						VIRTIO_NPU_STATUS_BAD_REQ, 0);
+	//检查响应头
+	if (!in_iov[0].iov_base ||
+		in_iov[0].iov_len < sizeof(struct virtio_npu_resp))
+		return 0;
+
+	model_len = virtio_guest_to_host_u32(vq->endian, req->input_len);
+	model_data = out_iov[1].iov_base;
+
+	if(!model_len || model_len > out_iov[1].iov_len)
+		return virtio_npu_write_resp(vq, in_iov, in,
+						VIRTIO_NPU_STATUS_BAD_REQ, 0);
+	ret = virtio_npu_load_model_from_buffer(ndev,model_data,model_len);
+
+	/*
+		LOAD_MODEL 成功返回这里建议返回 handle 1，不是 0,因为 guest 会把 resp.value 当成 model_handle。
+	*/
+	if(ret)
+		return virtio_npu_write_resp(vq, in_iov, in,
+						VIRTIO_NPU_STATUS_IOERR, 0);
+
+	return virtio_npu_write_resp(vq, in_iov, in,
+						VIRTIO_NPU_STATUS_OK, 1);
+}
+
 
 static void virtio_npu_do_request(struct kvm *kvm,struct npu_dev *ndev,struct virt_queue *vq)
 {
@@ -250,14 +479,22 @@ static void virtio_npu_do_request(struct kvm *kvm,struct npu_dev *ndev,struct vi
                                                  VIRTIO_NPU_STATUS_OK, 0x4e5055);
                 break;
 		case VIRTIO_NPU_CMD_INFER_DUMMY:
-	case VIRTIO_NPU_CMD_INFER_RAW:
-		used_len = virtio_npu_do_infer_common(ndev, vq, out_iov, out,
-						     in_iov, in, &req);
+			used_len = virtio_npu_do_infer_common(ndev, &virtio_npu_dummy_ops,
+								vq, out_iov, out,
+								in_iov, in, &req);
 				break;
-        default:
-                used_len = virtio_npu_write_resp(vq, in_iov, in,
-                                                 VIRTIO_NPU_STATUS_UNSUPP, cmd);
-	                break;
+		case VIRTIO_NPU_CMD_INFER_RAW:
+			used_len = virtio_npu_do_infer_common(ndev, ndev->backend_ops,
+								vq, out_iov, out,
+								in_iov, in, &req);
+				break;
+		case VIRTIO_NPU_CMD_LOAD_MODEL:
+			used_len = virtio_npu_do_load_model(ndev, vq, out_iov, out, in_iov, in, &req);
+			break;
+		default:
+				used_len = virtio_npu_write_resp(vq, in_iov, in,
+												VIRTIO_NPU_STATUS_UNSUPP, cmd);
+				break;
 	}
 
 	virt_queue__set_used_elem(vq, head, used_len);
@@ -352,7 +589,12 @@ int virtio_npu__init(struct kvm *kvm)
 	if (ndev == NULL)
 		return -ENOMEM;
 
-	ndev->backend_ops = &virtio_npu_dummy_ops;
+	ndev->kvm = kvm;
+
+	if (kvm->cfg.virtio_npu_model)
+		ndev->backend_ops = &virtio_npu_rknn_ops;
+	else
+		ndev->backend_ops = &virtio_npu_dummy_ops;
 
 	if (ndev->backend_ops->init) {
 		r = ndev->backend_ops->init(ndev);

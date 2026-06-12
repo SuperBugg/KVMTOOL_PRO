@@ -209,6 +209,8 @@ static int loglevel_parser(const struct option *opt, const char *arg, int unset)
 			" Random Number Generator"),			\
 	OPT_BOOLEAN('\0', "virtio-npu", &(cfg)->virtio_npu, "Enable"	\
 			" experimental virtio NPU device"),		\
+	OPT_STRING('\0', "virtio-npu-model", &(cfg)->virtio_npu_model,	\
+		   "path", "RKNN model path for virtio NPU"),		\
 	OPT_BOOLEAN('\0', "nodefaults", &(cfg)->nodefaults, "Disable"   \
 			" implicit configuration that cannot be"	\
 			" disabled otherwise"),				\
